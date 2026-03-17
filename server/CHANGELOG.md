@@ -1,3 +1,10 @@
+## [3.44.1](https://github.com/xynehq/xyne/compare/v3.44.0...v3.44.1) (2026-03-17)
+
+
+### Bug Fixes
+
+* haiku change to claude haiku ([#1287](https://github.com/xynehq/xyne/issues/1287)) ([64671b6](https://github.com/xynehq/xyne/commit/64671b667b5b3678778d0f45996f4ce3ca92f914))
+
 # [3.44.0](https://github.com/xynehq/xyne/compare/v3.43.4...v3.44.0) (2026-03-17)
 
 
