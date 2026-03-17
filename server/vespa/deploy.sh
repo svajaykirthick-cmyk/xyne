@@ -11,6 +11,7 @@ mkdir -p models
 TOKENIZER_URL=""
 MODEL_URL=""
 DIMS=
+RESET_EMBEDDER="${RESET_EMBEDDER:-false}"
 
 
 # URLs to download
@@ -29,8 +30,18 @@ elif [ "$EMBEDDING_MODEL" = "bge-large-en-v1.5" ]; then
     MODEL_URL="https://huggingface.co/BAAI/bge-large-en-v1.5/resolve/main/onnx/model.onnx"
     DIMS=1024
     echo "Deploying embedding model: $EMBEDDING_MODEL"
+elif [ "$EMBEDDING_MODEL" = "embeddinggemma-300m" ]; then
+    TOKENIZER_URL="https://huggingface.co/Ashx098/Embedding-Gemma_Onnx-for-vespa/resolve/main/tokenizer.json"
+    MODEL_URL="https://huggingface.co/Ashx098/Embedding-Gemma_Onnx-for-vespa/resolve/main/model_merged.onnx"
+    DIMS=768
+    echo "Deploying embedding model: $EMBEDDING_MODEL"
+elif [ "$EMBEDDING_MODEL" = "jina-embeddings-v5-text-nano" ]; then
+    TOKENIZER_URL="https://huggingface.co/12Sanju21/jina-embedder-v4-nano-for-vespa/resolve/main/tokenizer.json"
+    MODEL_URL="https://huggingface.co/12Sanju21/jina-embedder-v4-nano-for-vespa/resolve/main/model.onnx"
+    DIMS=768
+    echo "Deploying embedding model: $EMBEDDING_MODEL"
 else
-    echo "Error: Unknown EMBEDDING_MODEL value '$EMBEDDING_MODEL'. please add one of ['bge-small-en-v1.5','bge-base-en-v1.5','bge-large-en-v1.5']"
+    echo "Error: Unknown EMBEDDING_MODEL value '$EMBEDDING_MODEL'. please add one of ['bge-small-en-v1.5','bge-base-en-v1.5','bge-large-en-v1.5','embeddinggemma-300m','jina-embeddings-v5-text-nano'] to .env file"
     exit 1
 fi
 
@@ -39,6 +50,12 @@ bun run replaceDIMS.ts "$DIMS"
 # File paths
 TOKENIZER_FILE="models/tokenizer.json"
 MODEL_FILE="models/model.onnx"
+
+# Optionally force refresh of existing artifacts
+if [ "$RESET_EMBEDDER" = "true" ] || [ "$RESET_EMBEDDER" = "1" ]; then
+    echo "RESET_EMBEDDER is enabled — removing existing model and tokenizer."
+    rm -f models/tokenizer.json models/model.onnx
+fi
 
 # Download the tokenizer if it doesn't exist
 if [ -f "$TOKENIZER_FILE" ]; then
