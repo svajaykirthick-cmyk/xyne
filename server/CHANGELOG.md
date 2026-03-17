@@ -1,3 +1,10 @@
+# [3.44.0](https://github.com/xynehq/xyne/compare/v3.43.4...v3.44.0) (2026-03-17)
+
+
+### Features
+
+* added gemma embedder for vespa ([#1285](https://github.com/xynehq/xyne/issues/1285)) ([0eeb3f0](https://github.com/xynehq/xyne/commit/0eeb3f092722e52e36f965c3f79c17d1e9aaed4a))
+
 ## [3.43.4](https://github.com/xynehq/xyne/compare/v3.43.3...v3.43.4) (2026-03-13)
 
 
