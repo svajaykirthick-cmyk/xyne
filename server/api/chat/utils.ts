@@ -82,6 +82,20 @@ export type WorkingSet = {
 
 const MAX_FILES = 12
 
+/**
+ * Deduplication key for fragments: Vespa document id when present, otherwise fragment id.
+ * Used so the same document is not stored or re-fetched under different synthetic ids.
+ * NOTE: Current pipeline uses this to keep only ONE fragment per doc (drop/replace others),
+ * which can lose chunks when the same doc is returned from multiple queries. See
+ * server/api/chat/docs/fragments-dedupe-analysis.md for analysis and doc-centric merge design.
+ */
+export function getFragmentDedupKey(fragment: MinimalAgentFragment): string {
+  if (!fragment?.id) return ""
+  const vespaDocId = fragment.source?.docId
+  if (vespaDocId != null && vespaDocId !== "") return vespaDocId
+  return fragment.id
+}
+
 export function collectFollowupContext(
   messages: SelectMessage[],
   maxHops = 12,
@@ -1417,10 +1431,23 @@ export const checkAndYieldCitationsForAgent = async function* (
     span.setAttribute("has_image_citations", !!yieldedImageCitations)
     span.setAttribute("user_email", email)
 
+    // Reset global RegExp state so this function can be called repeatedly per request.
+    textToCitationIndex.lastIndex = 0
+    textToImageCitationIndex.lastIndex = 0
+    textToChunkCitationIndex.lastIndex = 0
+
     const text = splitGroupedCitationsWithSpaces(textInput)
+    // Fallback for weaker LLMs emitting KB citations as:
+    //   K[<docId>_<chunkIndex>]  (e.g. K[attf_<uuid>_21])
+    // instead of the expected:
+    //   K[<docIndex>_<chunkIndex>] (e.g. K[1_21])
+    const textToChunkCitationIndexWithDocKey =
+      /K\[([A-Za-z0-9_-]+)_([0-9]+)\]/g
+
     let match
     let imgMatch
     let chunkMatch
+    let chunkDocKeyMatch
     let citationsProcessed = 0
     let imageCitationsProcessed = 0
     let citationsYielded = 0
@@ -1428,16 +1455,44 @@ export const checkAndYieldCitationsForAgent = async function* (
     while (
       (match = textToCitationIndex.exec(text)) !== null ||
       (imgMatch = textToImageCitationIndex.exec(text)) !== null ||
-      ((chunkMatch = textToChunkCitationIndex.exec(text)) !== null)
+      ((chunkMatch = textToChunkCitationIndex.exec(text)) !== null) ||
+      ((chunkDocKeyMatch = textToChunkCitationIndexWithDocKey.exec(text)) !== null)
     ) {
-      if (match || chunkMatch) {
+      if (match || chunkMatch || chunkDocKeyMatch) {
         citationsProcessed++
-        let citationIndex = 0
+        let citationIndex: number | null = null
+        let rawChunkKey: string | undefined
         if (match) {
           citationIndex = parseInt(match[1], 10)
         } else if (chunkMatch) {
+          rawChunkKey = chunkMatch[1]
           citationIndex = parseInt(chunkMatch[1].split("_")[0], 10)
+        } else if (chunkDocKeyMatch) {
+          rawChunkKey = chunkDocKeyMatch[1]
+          const docKey = chunkDocKeyMatch[1]
+          if (/^\d+$/.test(docKey)) {
+            citationIndex = parseInt(docKey, 10)
+          } else {
+            // Map docKey (docId) -> numeric doc index (1-based) in `results`.
+            // We accept either `source.docId` or the fragment `id` as the possible emitter.
+            const docPos = results.findIndex(
+              (r) => r?.source?.docId === docKey || r.id === docKey,
+            )
+            citationIndex = docPos >= 0 ? docPos + 1 : null
+          }
         }
+        if (
+          citationIndex == null ||
+          Number.isNaN(citationIndex) ||
+          citationIndex <= 0
+        ) {
+          loggerWithChild({ email }).warn(
+            "[checkAndYieldCitationsForAgent] Found KB citation but could not resolve numeric index",
+            { rawChunkKey },
+          )
+          continue
+        }
+
         if (!yieldedCitations.has(citationIndex)) {
           const item = results[citationIndex - 1]
 

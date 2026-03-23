@@ -74,11 +74,19 @@ export interface TurnEndPipelineConfig {
     turn: number,
     emitter?: ReasoningEmitter
   ) => Promise<MinimalAgentFragment[]>
-  /** When useAgenticFiltering is false, called to promote unranked fragments into context (allFragments, turnFragments, seenDocuments) so they are preserved after cleanup. */
-  ingestFragments?: (
+  /** Build unranked fragments from merged document memory (one fragment per doc via answerContextMap). If returns non-empty, that list is used for ranking. */
+  getUnrankedFragmentsForRanking?: (
     context: AgentRunContext,
-    fragments: MinimalAgentFragment[],
     turn: number
+  ) => Promise<UnrankedFragmentWithToolContext[] | null>
+  /** When useAgenticFiltering is false, merge all current-turn document memory into cross-turn before ingestFragments. Receives turn for stagnation tracking. 
+   *  When rankedDocIds is provided, only merge docs in that set (filtered path);
+   *  when undefined, merge all docs (the no-ranking fallback path).
+   */
+  mergeCurrentTurnIntoCrossTurn?: (
+    context: AgentRunContext,
+    turn: number,
+    rankedDocIds?: Set<string>,
   ) => void
   /** Build review input for the turn range */
   buildReviewInput: (
@@ -99,8 +107,6 @@ export interface TurnEndPipelineConfig {
   emitter?: ReasoningEmitter
   /** Flush pending expectations */
   flushExpectations: () => void
-  /** Finalize turn images into context */
-  finalizeTurnImages: (context: AgentRunContext, turn: number) => void
   /** Reset current turn artifacts */
   resetTurnArtifacts: (context: AgentRunContext) => void
   /** Clear attachment phase metadata if needed */
@@ -247,7 +253,6 @@ export async function runTurnEndPipeline(
     // ────────────────────────────────────────────────────────────────────
     config.clearAttachmentPhase(context)
     config.flushExpectations()
-    config.finalizeTurnImages(context, turn)
     config.resetTurnArtifacts(context)
   }
 }
@@ -295,35 +300,42 @@ async function buildRankingTask(
   turn: number,
   emitter?: ReasoningEmitter,
 ): Promise<{ count: number } | null> {
-  const allUnrankedWithToolContext: UnrankedFragmentWithToolContext[] = []
-  for (const [toolKey, { query, fragments }] of artifacts.unrankedFragmentsByTool.entries()) {
-    const toolName = toolKey.substring(0, toolKey.indexOf(":"))
-    for (const fragment of fragments) {
-      allUnrankedWithToolContext.push({ fragment, toolName, toolQuery: query })
+  let allUnrankedWithToolContext: UnrankedFragmentWithToolContext[] = []
+
+  if (config.getUnrankedFragmentsForRanking) {
+    const fromMemory = await config.getUnrankedFragmentsForRanking(context, turn)
+    if (fromMemory && fromMemory.length > 0) {
+      allUnrankedWithToolContext = fromMemory
     }
   }
 
   if (allUnrankedWithToolContext.length === 0) return null
 
   if (config.useAgenticFiltering === false) {
-    // Skip LLM ranking but still promote fragments into context so they survive
-    // cleanup (resetTurnArtifacts) and are available for synthesis/citations.
     const fragments = allUnrankedWithToolContext.map((e) => e.fragment)
-    config.ingestFragments?.(context, fragments, turn)
+    context.turnRankedCount.set(turn, fragments.length)
+    config.mergeCurrentTurnIntoCrossTurn?.(context, turn)
     return { count: fragments.length }
   }
 
+  const toolOutputsWithRaw = artifacts.toolOutputs.filter(
+    (r) => (r.rawDocuments?.length ?? 0) > 0,
+  )
   Logger.debug(
     {
       turn,
       chatId: context.chat.externalId,
       totalUnranked: allUnrankedWithToolContext.length,
-      toolCount: artifacts.unrankedFragmentsByTool.size,
+      toolCount: toolOutputsWithRaw.length,
     },
     "[TurnLifecycle] Running batch fragment ranking."
   )
 
   const ranked = await config.rankFragments(context, allUnrankedWithToolContext, turn, emitter)
+  context.turnRankedCount.set(turn, ranked.length)
+  // Pass ranked doc IDs so merge callback only merges what was ranked/filtered.
+  const rankedDocIds = new Set(ranked.map((f) => f.source?.docId ?? f.id).filter(Boolean) as string[])
+  config.mergeCurrentTurnIntoCrossTurn?.(context, turn, rankedDocIds)
   return { count: ranked.length }
 }
 
@@ -365,9 +377,8 @@ function hasCurrentTurnFailure(context: AgentRunContext): boolean {
 }
 
 /**
- * True when the current turn is the newest in a STAGNATION_WINDOW of turns with tool calls that all produced 0 ranked fragments.
- * Anchored to currentTurn so we only trigger when ending a turn that had tool calls, not after reasoning-only turns.
- * "Useful information" = LLM-approved fragments in context, not raw retrieval.
+ * True when the current turn is the newest in a STAGNATION_WINDOW of turns with tool calls
+ * that all produced 0 ranked fragments (ranked count stored in context.turnRankedCount).
  */
 function hasStagnation(context: AgentRunContext, currentTurn: number): boolean {
   const turnNumbersWithToolCalls = [
@@ -376,8 +387,17 @@ function hasStagnation(context: AgentRunContext, currentTurn: number): boolean {
   const lastNTurns = turnNumbersWithToolCalls.slice(0, STAGNATION_WINDOW)
   if (lastNTurns.length < STAGNATION_WINDOW) return false
   if (lastNTurns[0] !== currentTurn) return false
+  // Prefer document-memory stagnation: no new chunks added in last N turns
+  const turnNewChunksCount = context.turnNewChunksCount
+  if (turnNewChunksCount && turnNewChunksCount.size > 0) {
+    const allZeroNewChunks = lastNTurns.every(
+      (t) => (turnNewChunksCount.get(t) ?? 0) === 0,
+    )
+    if (allZeroNewChunks) return true
+  }
+  // Fallback: all zero ranked fragments in last N turns
   const allZeroRanked = lastNTurns.every(
-    (t) => (context.turnFragments.get(t)?.length ?? 0) === 0,
+    (t) => (context.turnRankedCount.get(t) ?? 0) === 0,
   )
   return allZeroRanked
 }
