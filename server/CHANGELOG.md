@@ -1,3 +1,11 @@
+## [3.44.2](https://github.com/xynehq/xyne/compare/v3.44.1...v3.44.2) (2026-03-23)
+
+
+### Bug Fixes
+
+* highlight race conditions and display index ([#1289](https://github.com/xynehq/xyne/issues/1289)) ([35e5652](https://github.com/xynehq/xyne/commit/35e56526afe5129644683ccd6e06e0249bf87dd4))
+* improved agentic context handling and attachment passing ([#1288](https://github.com/xynehq/xyne/issues/1288)) ([a1e3078](https://github.com/xynehq/xyne/commit/a1e3078d450adbc07a6a52a5ab715011a5bb7dee))
+
 ## [3.44.1](https://github.com/xynehq/xyne/compare/v3.44.0...v3.44.1) (2026-03-17)
 
 
