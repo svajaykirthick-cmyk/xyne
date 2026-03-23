@@ -35,6 +35,20 @@ const isScrollable = (element: HTMLElement): boolean => {
   )
 }
 
+/** react-pdf uses 1-based `data-page-number`; chunk API uses 0-based page index. */
+function findPdfPageRoot(
+  root: HTMLElement,
+  pageIndex0: number,
+): HTMLElement | null {
+  if (pageIndex0 < 0) return null
+  const selector = `[data-page-number="${pageIndex0 + 1}"]`
+  // Check if root itself matches the selector
+  if (root.matches(selector)) {
+    return root
+  }
+  return root.querySelector<HTMLElement>(selector)
+}
+
 export function useScopedFind(
   containerRef: React.RefObject<HTMLElement>,
   opts: Options = {},
@@ -57,17 +71,19 @@ export function useScopedFind(
   const [index, setIndex] = useState(0)
   const [isLoading, setIsLoading] = useState(false)
 
-  // Generate cache key based on document ID, chunk index, and options
+  // Generate cache key based on document ID, chunk index, page (PDF scope), and options
   const generateCacheKey = useCallback(
     (
       docId: string | undefined,
       chunkIdx: number | null | undefined,
+      pageIdx?: number,
     ): string => {
       const keyComponents = [
         docId || "no-doc-id",
         chunkIdx !== null && chunkIdx !== undefined
           ? chunkIdx.toString()
           : "no-chunk-idx",
+        pageIdx !== undefined && pageIdx >= 0 ? `p${pageIdx}` : "p-na",
       ]
       return keyComponents.join("|")
     },
@@ -425,10 +441,8 @@ export function useScopedFind(
     [isPDFContext, createOverlayHighlights, createMarkHighlights, debug],
   )
 
-  const clearHighlights = useCallback(() => {
-    const root = containerRef.current
-    if (!root) return
-
+  // Internal function to clear DOM highlights without affecting the cancellation token
+  const clearHighlightsFromDOM = useCallback((root: HTMLElement) => {
     // Clear mark-based highlights
     const marks = root.querySelectorAll<HTMLElement>("mark[data-match-index]")
     marks.forEach((m) => {
@@ -453,20 +467,38 @@ export function useScopedFind(
     individualOverlays.forEach((overlay) => {
       overlay.remove()
     })
+  }, [])
+
+  // Exported function: increments token to cancel pending work, clears DOM, resets state
+  const clearHighlights = useCallback(() => {
+    const root = containerRef.current
+    if (!root) return
+
+    // Increment token to invalidate any pending async work
+    callTokenRef.current += 1
+
+    clearHighlightsFromDOM(root)
 
     setMatches([])
     setIndex(0)
-  }, [containerRef])
+  }, [containerRef, clearHighlightsFromDOM])
 
   // Wait for text layer to be fully rendered and positioned
   const waitForTextLayerReady = useCallback(
-    async (container: HTMLElement, timeoutMs = 5000): Promise<string> => {
+    async (
+      container: HTMLElement,
+      timeoutMs = 5000,
+      opts?: { searchPhrase?: string; caseSensitive?: boolean },
+    ): Promise<string> => {
+      const searchPhrase = opts?.searchPhrase?.trim()
+      const caseSensitive = opts?.caseSensitive ?? false
+
       return new Promise((resolve) => {
         const startTime = Date.now()
-        let lastTextLength = 0
+        let lastTextLength = -1
         let text = ""
         let stableCount = 0
-        const requiredStableChecks = 3
+        const requiredStableChecks = 4
 
         const checkTextLayer = () => {
           const currentTime = Date.now()
@@ -478,7 +510,6 @@ export function useScopedFind(
             return
           }
 
-          // Extract current text length
           text = extractContainerText(container)
           const currentTextLength = text.length
 
@@ -488,31 +519,54 @@ export function useScopedFind(
             )
           }
 
-          // Check if text length has stabilized
-          if (currentTextLength === lastTextLength && currentTextLength > 0) {
+          const lengthStable =
+            currentTextLength === lastTextLength && currentTextLength > 0
+
+          if (lengthStable) {
             stableCount++
-            if (stableCount >= requiredStableChecks) {
-              if (debug) {
-                console.log(
-                  `Text layer stabilized at length ${currentTextLength}`,
-                )
-              }
-              resolve(text)
-              return
-            }
           } else {
             stableCount = 0
           }
 
           lastTextLength = currentTextLength
 
-          // Use requestAnimationFrame for the next check to ensure DOM updates are processed
+          const stableEnough = stableCount >= requiredStableChecks
+          let matchOk = true
+          if (stableEnough && searchPhrase) {
+            const result = findHighlightMatches(searchPhrase, text, {
+              caseSensitive,
+            })
+            matchOk = !!(
+              result.success &&
+              result.matches &&
+              result.matches.length > 0
+            )
+            if (debug && !matchOk) {
+              console.log(
+                "Text layer stable but chunk text not matchable yet; keep waiting",
+              )
+            }
+          }
+
+          if (stableEnough && (!searchPhrase || matchOk)) {
+            if (debug) {
+              console.log(
+                `Text layer ready (length ${currentTextLength}${searchPhrase ? ", match verified" : ""})`,
+              )
+            }
+            resolve(text)
+            return
+          }
+
+          if (stableEnough && searchPhrase && !matchOk) {
+            stableCount = 0
+          }
+
           requestAnimationFrame(() => {
-            setTimeout(checkTextLayer, 50) // Check every 50ms
+            setTimeout(checkTextLayer, 50)
           })
         }
 
-        // Start checking after one animation frame
         requestAnimationFrame(checkTextLayer)
       })
     },
@@ -526,9 +580,9 @@ export function useScopedFind(
       pageIndex?: number,
       waitForTextLayer: boolean = false,
     ): Promise<boolean> => {
-      // Increment call token to track this invocation
-      const currentToken = ++callTokenRef.current
-      
+      callTokenRef.current += 1
+      const currentToken = callTokenRef.current
+
       if (debug) {
         console.log("highlightText called with:", text, "token:", currentToken)
       }
@@ -543,31 +597,79 @@ export function useScopedFind(
         console.log("Container found:", root)
       }
 
-      clearHighlights()
+      clearHighlightsFromDOM(root)
       if (!text) return false
 
       setIsLoading(true)
 
       try {
         let containerText = ""
-        // For PDFs, ensure the page is rendered before extracting text
+        /** Where to resolve character offsets (single PDF page vs full viewer root). */
+        let highlightScope: HTMLElement = root
+
+        // For PDFs / spreadsheets: goToPage → waitForPageReady (PDF) → extract on page scope.
         if (documentOperationsRef?.current?.goToPage) {
           if (debug) {
             console.log("PDF or Spreadsheet detected", pageIndex)
           }
           if (pageIndex !== undefined && pageIndex >= 0) {
+            const waitForPageReadyFn =
+              documentOperationsRef.current.waitForPageReady
+
             if (debug) {
               console.log("Going to page or subsheet:", pageIndex)
             }
             await documentOperationsRef.current.goToPage(pageIndex)
-
-            // Wait for text layer to be fully rendered and positioned
-            if (debug) {
-              console.log("Waiting for text layer to be ready...")
+            if (currentToken !== callTokenRef.current) {
+              if (debug) {
+                console.log("Stale call after goToPage, aborting")
+              }
+              return false
             }
-            containerText = await waitForTextLayerReady(root)
-            if (debug) {
-              console.log("Text layer ready, proceeding with highlighting")
+
+            if (waitForPageReadyFn) {
+              if (debug) {
+                console.log("Waiting for page ready (canvas + text + annotations)...")
+              }
+              await waitForPageReadyFn(pageIndex)
+            }
+            if (currentToken !== callTokenRef.current) {
+              if (debug) {
+                console.log("Stale call after waitForPageReady, aborting")
+              }
+              return false
+            }
+
+            if (isPDFContext(root)) {
+              const pageRoot = findPdfPageRoot(root, pageIndex)
+              if (!pageRoot) {
+                if (debug) {
+                  console.log(`PDF page ${pageIndex} not found, skipping highlight`)
+                }
+                return false
+              }
+              highlightScope = pageRoot
+            }
+
+            if (waitForPageReadyFn) {
+              containerText = extractContainerText(highlightScope)
+              if (debug) {
+                console.log(
+                  "Page ready; extracted text length:",
+                  containerText.length,
+                )
+              }
+            } else {
+              if (debug) {
+                console.log("Waiting for text layer (non-PDF readiness)...")
+              }
+              containerText = await waitForTextLayerReady(highlightScope, 5000, {
+                searchPhrase: text,
+                caseSensitive,
+              })
+              if (debug) {
+                console.log("Text layer ready, proceeding with highlighting")
+              }
             }
           } else {
             if (debug) {
@@ -579,10 +681,49 @@ export function useScopedFind(
           }
         } else {
           if (waitForTextLayer) {
-            containerText = await waitForTextLayerReady(root)
+            containerText = await waitForTextLayerReady(root, 5000, {
+              searchPhrase: text,
+              caseSensitive,
+            })
           } else {
             containerText = extractContainerText(root)
           }
+        }
+
+        if (currentToken !== callTokenRef.current) {
+          if (debug) {
+            console.log("Stale call after text extraction, aborting")
+          }
+          return false
+        }
+
+        // PDF text layer can briefly lag readiness; one retry after layout frames.
+        if (
+          containerText.length === 0 &&
+          isPDFContext(root) &&
+          pageIndex !== undefined &&
+          pageIndex >= 0
+        ) {
+          await new Promise<void>((resolve) => {
+            requestAnimationFrame(() => {
+              requestAnimationFrame(() => resolve())
+            })
+          })
+          if (currentToken !== callTokenRef.current) {
+            return false
+          }
+          containerText = extractContainerText(highlightScope)
+        }
+
+        if (currentToken !== callTokenRef.current) {
+          return false
+        }
+
+        if (containerText.length === 0) {
+          if (debug) {
+            console.log("No extractable text; skipping highlight and cache")
+          }
+          return false
         }
 
         if (debug) {
@@ -592,10 +733,10 @@ export function useScopedFind(
         // Clean expired cache entries
         cleanExpiredCache()
 
-        // Generate cache key
+        // Generate cache key (include page so PDF page-scoped offsets stay valid)
         const canUseCache = !!documentId
         const cacheKey = canUseCache
-          ? generateCacheKey(documentId, chunkIndex)
+          ? generateCacheKey(documentId, chunkIndex, pageIndex)
           : ""
 
         // Check cache first (only if safe)
@@ -625,6 +766,10 @@ export function useScopedFind(
               "Cache miss, computing highlights client-side for key:",
               cacheKey,
             )
+          }
+
+          if (currentToken !== callTokenRef.current) {
+            return false
           }
 
           // Use client-side highlighting instead of API call
@@ -668,7 +813,7 @@ export function useScopedFind(
               console.log("Cached successful result for key:", cacheKey)
             }
           } else if (!canUseCache && debug) {
-            console.log("Skipping cache write (no documentId)")
+            console.log("Skipping cache write (no documentId or empty text)")
           }
         }
 
@@ -680,13 +825,16 @@ export function useScopedFind(
           return false
         }
 
+        // Drop any stray marks from a racing call that finished after our initial clear.
+        clearHighlightsFromDOM(root)
+
         // Create highlight marks for all matches
         const allMarks: HTMLElement[] = []
         let longestMatchIndex = 0
         let longestMatchLength = 0
 
         matches.forEach((match, matchIndex) => {
-          const marks = createHighlightMarks(root, match)
+          const marks = createHighlightMarks(highlightScope, match)
 
           marks.forEach((mark) => {
             mark.setAttribute("data-match-index", matchIndex.toString())
@@ -714,17 +862,14 @@ export function useScopedFind(
           if (debug) {
             console.log("Stale call detected before state update, aborting and cleaning up DOM")
           }
-          // Clean up the highlights we just created since this call is stale
           allMarks.forEach((mark) => {
             if (mark.parentNode) {
               if (mark.tagName === "MARK") {
-                // Unwrap mark elements
                 while (mark.firstChild) {
                   mark.parentNode.insertBefore(mark.firstChild, mark)
                 }
                 mark.parentNode.removeChild(mark)
               } else {
-                // Remove overlay elements
                 mark.remove()
               }
             }
@@ -738,6 +883,9 @@ export function useScopedFind(
         return allMarks.length > 0
       } catch (error) {
         console.error("Error during client-side highlighting:", error)
+        if (currentToken === callTokenRef.current) {
+          clearHighlightsFromDOM(root)
+        }
         return false
       } finally {
         // Only update loading state if this is still the latest call
@@ -747,7 +895,7 @@ export function useScopedFind(
       }
     },
     [
-      clearHighlights,
+      clearHighlightsFromDOM,
       containerRef,
       extractContainerText,
       createHighlightMarks,
@@ -756,6 +904,9 @@ export function useScopedFind(
       documentId,
       generateCacheKey,
       cleanExpiredCache,
+      documentOperationsRef,
+      isPDFContext,
+      waitForTextLayerReady,
     ],
   )
 
