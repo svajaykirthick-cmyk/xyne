@@ -26,7 +26,7 @@ import {
   type WebSearchSource,
 } from "@/ai/types"
 import config from "@/config"
-import { getModelValueFromLabel } from "@/ai/modelConfig"
+import { getModelValueFromLabel, MODEL_CONFIGURATIONS } from "@/ai/modelConfig"
 import { getAvailableModels } from "@/ai/fetchModels"
 import {
   deleteChatByExternalIdWithAuth,
@@ -192,6 +192,7 @@ import {
   formatAgentScopesText,
   processMessage,
   safeDecodeURIComponent,
+  cleanCitationsFromResponse,
 } from "./utils"
 import {
   buildKnowledgeBaseCollectionSelections,
@@ -352,7 +353,6 @@ const {
   maxChunksPerPage,
   chatPageSize,
   isReasoning,
-  fastModelReasoning,
   StartThinkingToken,
   EndThinkingToken,
   maxValidLinks,
@@ -703,7 +703,7 @@ async function* processIterator(
   iterator: AsyncIterableIterator<ConverseResponse>,
   results: VespaSearchResult[],
   previousResultsLength: number = 0,
-  userRequestsReasoning?: boolean,
+  userRequestsReasoningAndEnabled?: boolean,
   email?: string,
   allowChunkCitations?: boolean,
 ): AsyncIterableIterator<
@@ -716,7 +716,7 @@ async function* processIterator(
   let currentAnswer = ""
   let parsed = { answer: "" }
   let thinking = ""
-  let reasoning = config.isReasoning && userRequestsReasoning
+  let reasoning = userRequestsReasoningAndEnabled
   let yieldedCitations = new Set<number>()
   let yieldedImageCitations = new Set<number>()
   // tied to the json format and output expected, we expect the answer key to be present
@@ -811,6 +811,45 @@ async function* processIterator(
 
     if (chunk.cost) {
       yield { cost: chunk.cost }
+    }
+  }
+
+  if (currentAnswer) {
+    return currentAnswer
+  }
+  if (parsed.answer) {
+    return parsed.answer
+  }
+
+  const finalBuffer = cleanBuffer(buffer)
+  if (finalBuffer) {
+    try {
+      const recovered = jsonParseLLMOutput(finalBuffer, ANSWER_TOKEN)
+      if (recovered?.answer) {
+        const recoveredAnswer = recovered.answer
+        if (currentAnswer !== recoveredAnswer) {
+          const baseLength = currentAnswer.length
+          const newText = recoveredAnswer.slice(baseLength)
+          currentAnswer = recoveredAnswer
+
+          if (newText.length > 0) {
+            yield { text: newText }
+          }
+
+          yield* checkAndYieldCitations(
+            recoveredAnswer,
+            yieldedCitations,
+            results,
+            previousResultsLength,
+            email!,
+            yieldedImageCitations,
+            allowChunkCitations,
+          )
+        }
+        return currentAnswer
+      }
+    } catch {
+      // no-op
     }
   }
 
@@ -1258,7 +1297,7 @@ async function* generateIterativeTimeFilterAndQueryRewrite(
   maxPageNumber: number = 3,
   maxSummaryCount: number | undefined,
   classification: QueryRouterLLMResponse,
-  userRequestsReasoning?: boolean,
+  userRequestsReasoningAndEnabled?: boolean,
   queryRagSpan?: Span,
   agentPrompt?: string,
   modelId?: string,
@@ -1855,7 +1894,7 @@ async function* generateIterativeTimeFilterAndQueryRewrite(
             stream: true,
             modelId: modelId || defaultBestModel,
             messages,
-            reasoning: config.isReasoning && userRequestsReasoning,
+            reasoning: userRequestsReasoningAndEnabled,
             agentPrompt,
             imageFileNames,
           },
@@ -1867,7 +1906,7 @@ async function* generateIterativeTimeFilterAndQueryRewrite(
           iterator,
           totalResults,
           previousResultsLength,
-          config.isReasoning && userRequestsReasoning,
+          userRequestsReasoningAndEnabled,
           email,
           agentSpecificCollectionSelections.length > 0,
         )
@@ -1880,7 +1919,7 @@ async function* generateIterativeTimeFilterAndQueryRewrite(
           queryRagSpan?.end()
           return
         }
-        if (config.isReasoning && userRequestsReasoning) {
+        if (userRequestsReasoningAndEnabled) {
           previousResultsLength += totalResults.length
         }
         ragSpan?.end()
@@ -2071,7 +2110,7 @@ async function* generateIterativeTimeFilterAndQueryRewrite(
       {
         stream: true,
         modelId: modelId || defaultBestModel,
-        reasoning: config.isReasoning && userRequestsReasoning,
+        reasoning: userRequestsReasoningAndEnabled,
         agentPrompt,
         messages,
         imageFileNames,
@@ -2084,7 +2123,7 @@ async function* generateIterativeTimeFilterAndQueryRewrite(
       iterator,
       results?.root?.children,
       previousResultsLength,
-      config.isReasoning && userRequestsReasoning,
+      userRequestsReasoningAndEnabled,
       email,
       agentSpecificCollectionSelections.length > 0,
     )
@@ -2097,7 +2136,7 @@ async function* generateIterativeTimeFilterAndQueryRewrite(
       queryRagSpan?.end()
       return
     }
-    if (config.isReasoning && userRequestsReasoning) {
+    if (userRequestsReasoningAndEnabled) {
       previousResultsLength += results?.root?.children?.length || 0
       pageSpan?.setAttribute("previous_results_length", previousResultsLength)
     }
@@ -2120,7 +2159,7 @@ async function* generateAnswerFromGivenContext(
   userMetadata: UserMetadataType,
   alpha: number = 0.5,
   fileIds: string[],
-  userRequestsReasoning: boolean,
+  userRequestsReasoningAndEnabled: boolean,
   agentPrompt?: string,
   passedSpan?: Span,
   threadIds?: string[],
@@ -2185,6 +2224,7 @@ async function* generateAnswerFromGivenContext(
 
   let previousResultsLength = 0
   const combinedSearchResponse: VespaSearchResult[] = []
+  const attachmentFallbackDocs: VespaSearchResult[] = []
   let chunksPerDocument: number[] = []
   const targetChunks = maxChunksPerPage
 
@@ -2249,8 +2289,27 @@ async function* generateAnswerFromGivenContext(
             rankProfile: SearchModes.AttachmentRank,
           },
         )
-        if (results.root.children) {
+        if (results.root.children && results.root.children.length > 0) {
           combinedSearchResponse.push(...results.root.children)
+        } else {
+          // Fallback: if Vespa search can't score attachments (or yields nothing),
+          // fetch the raw attachment documents directly and treat them as equal-weight hits.
+          const createdDirectFetchSpan = !fileSearchSpan && !generateAnswerSpan
+          const directFetchSpan: Span =
+            fileSearchSpan ??
+            generateAnswerSpan ??
+            passedSpan?.startSpan("attachment_direct_doc_fetch") ??
+            getTracer("chat").startSpan("attachment_direct_doc_fetch")
+          const direct = await GetDocumentsByDocIds(
+            attachmentFileIds,
+            directFetchSpan,
+          )
+          if (direct?.root?.children?.length) {
+            attachmentFallbackDocs.push(...direct.root.children)
+          }
+          if (createdDirectFetchSpan) {
+            directFetchSpan.end()
+          }
         }
       }
     }
@@ -2375,6 +2434,13 @@ async function* generateAnswerFromGivenContext(
     userMetadata.userId,
     userMetadata.workspaceId,
   )
+
+  if(attachmentFallbackDocs.length > 0) {
+    loggerWithChild({ email: email }).info(
+      `Adding ${attachmentFallbackDocs.length} attachment fallback documents to the context`,
+    )
+    combinedSearchResponse.push(...attachmentFallbackDocs)
+  }
   const contextPromises = combinedSearchResponse?.map(async (v, i) => {
     let content = await answerContextMap(
       v as VespaSearchResults,
@@ -2452,7 +2518,7 @@ async function* generateAnswerFromGivenContext(
     {
       stream: true,
       modelId: modelId ? (modelId as Models) : defaultBestModel,
-      reasoning: config.isReasoning && userRequestsReasoning,
+      reasoning: userRequestsReasoningAndEnabled,
       agentPrompt,
       imageFileNames: finalImageFileNames,
       messages: messages,
@@ -2465,7 +2531,7 @@ async function* generateAnswerFromGivenContext(
     iterator,
     combinedSearchResponse,
     previousResultsLength,
-    userRequestsReasoning,
+    userRequestsReasoningAndEnabled,
     email,
     allowChunkCitations,
   )
@@ -2485,7 +2551,7 @@ async function* generateAnswerFromGivenContext(
     generateAnswerSpan?.end()
     return
   }
-  if (config.isReasoning && userRequestsReasoning) {
+  if (userRequestsReasoningAndEnabled) {
     previousResultsLength += combinedSearchResponse?.length || 0
   }
   generateAnswerSpan?.end()
@@ -2508,7 +2574,7 @@ export async function* generateAnswerFromDualRag(
   alpha: number = 0.5,
   fileIds: string[],// contains all attachement fileids
   agentAppEnums: Apps[],
-  userRequestsReasoning: boolean,
+  userRequestsReasoningAndEnabled: boolean,
   agentPrompt?: string,
   passedSpan?: Span,
   threadIds?: string[],
@@ -3046,7 +3112,7 @@ export async function* generateAnswerFromDualRag(
     {
       stream: true,
       modelId: modelId ? (modelId as Models) : defaultBestModel,
-      reasoning: config.isReasoning && userRequestsReasoning,
+      reasoning: userRequestsReasoningAndEnabled,
       agentPrompt,
       imageFileNames: finalImageFileNames,
     },
@@ -3058,7 +3124,7 @@ export async function* generateAnswerFromDualRag(
     iterator,
     combinedSearchResponse,
     previousResultsLength,
-    userRequestsReasoning,
+    userRequestsReasoningAndEnabled,
     email,
     allowChunkCitations,
   )
@@ -3077,7 +3143,7 @@ export async function* generateAnswerFromDualRag(
     return
   }
 
-  if (config.isReasoning && userRequestsReasoning) {
+  if (userRequestsReasoningAndEnabled) {
     previousResultsLength += combinedSearchResponse?.length || 0
   }
   generateAnswerSpan?.end()
@@ -3215,7 +3281,7 @@ async function* generatePointQueryTimeExpansion(
   alpha: number,
   pageSize: number = 10,
   maxSummaryCount: number | undefined,
-  userRequestsReasoning: boolean,
+  userRequestsReasoningAndEnabled: boolean,
   eventRagSpan?: Span,
   agentPrompt?: string,
   modelId?: string,
@@ -3660,7 +3726,7 @@ async function* generatePointQueryTimeExpansion(
       {
         stream: true,
         modelId: modelId || defaultBestModel,
-        reasoning: config.isReasoning && userRequestsReasoning,
+        reasoning: userRequestsReasoningAndEnabled,
         agentPrompt,
         imageFileNames,
       },
@@ -3670,7 +3736,7 @@ async function* generatePointQueryTimeExpansion(
       iterator,
       combinedResults?.root?.children,
       previousResultsLength,
-      config.isReasoning && userRequestsReasoning,
+      userRequestsReasoningAndEnabled,
       email,
     )
     ragSpan?.end()
@@ -3685,7 +3751,7 @@ async function* generatePointQueryTimeExpansion(
       return
     }
     // only increment in the case of reasoning
-    if (config.isReasoning && userRequestsReasoning) {
+    if (userRequestsReasoningAndEnabled) {
       previousResultsLength += combinedResults?.root?.children?.length || 0
       iterationSpan?.setAttribute(
         "previous_results_length",
@@ -3750,7 +3816,7 @@ async function* processResultsForMetadata(
   app: Apps[] | null,
   entity: any,
   chunksCount: number | undefined,
-  userRequestsReasoning?: boolean,
+  userRequestsReasoningAndEnabled?: boolean,
   span?: Span,
   email?: string,
   agentContext?: string,
@@ -3785,7 +3851,7 @@ async function* processResultsForMetadata(
   const streamOptions = {
     stream: true,
     modelId: modelId ? (modelId as Models) : defaultBestModel,
-    reasoning: config.isReasoning && userRequestsReasoning,
+    reasoning: userRequestsReasoningAndEnabled,
     imageFileNames,
     agentPrompt: agentContext,
   }
@@ -3817,7 +3883,7 @@ async function* processResultsForMetadata(
     iterator,
     items,
     0,
-    config.isReasoning && userRequestsReasoning,
+    userRequestsReasoningAndEnabled,
     email,
     isMsgWithKbItems,
   )
@@ -3833,7 +3899,7 @@ async function* generateMetadataQueryAnswer(
   pageSize: number = 10,
   maxSummaryCount: number | undefined,
   classification: QueryRouterLLMResponse,
-  userRequestsReasoning?: boolean,
+  userRequestsReasoningAndEnabled?: boolean,
   span?: Span,
   agentPrompt?: string,
   maxIterations = 5,
@@ -4081,7 +4147,7 @@ async function* generateMetadataQueryAnswer(
     }
     span?.setAttribute(
       "isReasoning",
-      userRequestsReasoning && config.isReasoning ? true : false,
+      userRequestsReasoningAndEnabled ? true : false,
     )
     span?.setAttribute("modelId", defaultBestModel)
     loggerWithChild({ email: email }).info(
@@ -4206,7 +4272,7 @@ async function* generateMetadataQueryAnswer(
         apps,
         entities,
         undefined,
-        userRequestsReasoning,
+        userRequestsReasoningAndEnabled,
         span,
         email,
         agentPrompt,
@@ -4248,7 +4314,7 @@ async function* generateMetadataQueryAnswer(
     span?.setAttribute("Search_Type", QueryType.GetItems)
     span?.setAttribute(
       "isReasoning",
-      userRequestsReasoning && config.isReasoning ? true : false,
+      userRequestsReasoningAndEnabled ? true : false,
     )
     span?.setAttribute("modelId", defaultBestModel)
     loggerWithChild({ email: email }).info(
@@ -4447,7 +4513,7 @@ async function* generateMetadataQueryAnswer(
       apps,
       entities,
       maxSummaryCount,
-      userRequestsReasoning,
+      userRequestsReasoningAndEnabled,
       span,
       email,
       agentPrompt,
@@ -4465,7 +4531,7 @@ async function* generateMetadataQueryAnswer(
     span?.setAttribute("Search_Type", QueryType.SearchWithFilters)
     span?.setAttribute(
       "isReasoning",
-      userRequestsReasoning && config.isReasoning ? true : false,
+      userRequestsReasoningAndEnabled ? true : false,
     )
     span?.setAttribute("modelId", defaultBestModel)
     loggerWithChild({ email: email }).info(
@@ -4650,7 +4716,7 @@ async function* generateMetadataQueryAnswer(
         apps,
         entities,
         undefined,
-        userRequestsReasoning,
+        userRequestsReasoningAndEnabled,
         span,
         email,
         agentPrompt,
@@ -4768,7 +4834,7 @@ export async function* UnderstandMessageAndAnswer(
   classification: QueryRouterLLMResponse,
   messages: Message[],
   alpha: number,
-  userRequestsReasoning: boolean,
+  userRequestsReasoningAndEnabled: boolean,
   passedSpan?: Span,
   agentPrompt?: string,
   modelId?: string,
@@ -4820,7 +4886,7 @@ export async function* UnderstandMessageAndAnswer(
       count,
       maxDefaultSummary,
       classification,
-      config.isReasoning && userRequestsReasoning,
+      userRequestsReasoningAndEnabled,
       metadataRagSpan,
       agentPrompt,
       5,
@@ -4872,7 +4938,7 @@ export async function* UnderstandMessageAndAnswer(
       alpha,
       chatPageSize,
       maxDefaultSummary,
-      userRequestsReasoning,
+      userRequestsReasoningAndEnabled,
       eventRagSpan,
       agentPrompt,
       modelId,
@@ -4897,7 +4963,7 @@ export async function* UnderstandMessageAndAnswer(
       3,
       maxDefaultSummary,
       classification,
-      userRequestsReasoning,
+      userRequestsReasoningAndEnabled,
       ragSpan,
       agentPrompt, // Pass agentPrompt to generateIterativeTimeFilterAndQueryRewrite
       modelId,
@@ -4914,7 +4980,7 @@ export async function* UnderstandMessageAndAnswerForGivenContext(
   message: string,
   alpha: number,
   fileIds: string[],
-  userRequestsReasoning: boolean,
+  userRequestsReasoningAndEnabled: boolean,
   passedSpan?: Span,
   threadIds?: string[],
   attachmentFileIds?: string[],
@@ -4938,8 +5004,8 @@ export async function* UnderstandMessageAndAnswerForGivenContext(
   passedSpan?.setAttribute("threadIds", JSON.stringify(threadIds))
   passedSpan?.setAttribute("threadIds_count", threadIds?.length || 0)
   passedSpan?.setAttribute(
-    "userRequestsReasoning",
-    userRequestsReasoning || false,
+    "userRequestsReasoningAndEnabled",
+    userRequestsReasoningAndEnabled || false,
   )
 
   return yield* generateAnswerFromGivenContext(
@@ -4949,7 +5015,7 @@ export async function* UnderstandMessageAndAnswerForGivenContext(
     userMetadata,
     alpha,
     fileIds,
-    userRequestsReasoning,
+    userRequestsReasoningAndEnabled,
     agentPrompt,
     passedSpan,
     threadIds,
@@ -5246,7 +5312,7 @@ export const MessageApi = async (c: Context) => {
       : []
 
     // If none of the above, proceed with default RAG flow
-    const userRequestsReasoning = isReasoningEnabled
+    const userRequestsReasoningAndEnabled = config.isReasoning && isReasoningEnabled
     if (!message) {
       throw new HTTPException(400, {
         message: "Message is required",
@@ -5510,9 +5576,8 @@ export const MessageApi = async (c: Context) => {
             let imageCitations: any[] = []
             let citationMap: Record<number, number> = {}
             let thinking = ""
-            let reasoning =
-              userRequestsReasoning &&
-              ragPipelineConfig[RagPipelineStages.AnswerOrSearch].reasoning
+            const reasoning =
+              userRequestsReasoningAndEnabled && (MODEL_CONFIGURATIONS[actualModelId as Models || config.defaultBestModel]?.reasoning ?? true) === true
 
             const understandSpan = streamSpan.startSpan("understand_message")
             understandSpan?.setAttribute(
@@ -5528,7 +5593,7 @@ export const MessageApi = async (c: Context) => {
               message,
               0.5,
               fileIds,
-              userRequestsReasoning,
+              reasoning,
               understandSpan,
               threadIds,
               imageAttachmentFileIds,
@@ -5546,7 +5611,6 @@ export const MessageApi = async (c: Context) => {
 
             answer = ""
             thinking = ""
-            reasoning = isReasoning && userRequestsReasoning
             citations = []
             citationMap = {}
             let citationValues: Record<number, number> = {}
@@ -5815,18 +5879,18 @@ export const MessageApi = async (c: Context) => {
             )
 
             let searchOrAnswerIterator
+            let reasoning
             if (deepResearchEnabled) {
               loggerWithChild({ email: email }).info(
                 "Using deep research for the question",
               )
+              reasoning = userRequestsReasoningAndEnabled && (MODEL_CONFIGURATIONS[config.defaultDeepResearchModel]?.reasoning ?? true) === true
               searchOrAnswerIterator = getDeepResearchResponse(message, ctx, {
                 modelId: config.defaultDeepResearchModel,
                 stream: true,
                 json: false,
                 agentPrompt: JSON.stringify(agentDetails),
-                reasoning:
-                  userRequestsReasoning &&
-                  ragPipelineConfig[RagPipelineStages.AnswerOrSearch].reasoning,
+                reasoning,
                 messages: llmFormattedMessages,
                 webSearch: false,
                 deepResearchEnabled: true,
@@ -5835,6 +5899,7 @@ export const MessageApi = async (c: Context) => {
               loggerWithChild({ email: email }).info(
                 "Using web search for the question",
               )
+              reasoning = userRequestsReasoningAndEnabled && (MODEL_CONFIGURATIONS[config.defaultWebSearchModel]?.reasoning ?? true) === true
               searchOrAnswerIterator = webSearchQuestion(
                 message,
                 ctx,
@@ -5843,10 +5908,7 @@ export const MessageApi = async (c: Context) => {
                   stream: true,
                   json: false,
                   agentPrompt: JSON.stringify(agentDetails),
-                  reasoning:
-                    userRequestsReasoning &&
-                    ragPipelineConfig[RagPipelineStages.AnswerOrSearch]
-                      .reasoning,
+                  reasoning,
                   messages: llmFormattedMessages,
                   webSearch: true,
                 },
@@ -5855,6 +5917,7 @@ export const MessageApi = async (c: Context) => {
             } else {
               // Get connected apps for LLM prompt
               const connectedApps = await getConnectedApps(db, email)
+              reasoning = userRequestsReasoningAndEnabled && (MODEL_CONFIGURATIONS[actualModelId as Models || config.defaultBestModel]?.reasoning ?? true) === true
 
               searchOrAnswerIterator =
                 generateSearchQueryOrAnswerFromConversation(
@@ -5868,10 +5931,7 @@ export const MessageApi = async (c: Context) => {
                     stream: true,
                     json: true,
                     agentPrompt: agentPromptValue,
-                    reasoning:
-                      userRequestsReasoning &&
-                      ragPipelineConfig[RagPipelineStages.AnswerOrSearch]
-                        .reasoning,
+                    reasoning,
                     messages: llmFormattedMessages,
                     // agentPrompt: agentPrompt, // agentPrompt here is the original from request, might be empty string
                     // AgentMessageApi/CombinedAgentSlackApi handle fetching full agent details
@@ -5915,11 +5975,9 @@ export const MessageApi = async (c: Context) => {
               mailParticipants: {},
               filters: queryFilters,
             }
+            let hasConversationAnswer = false
 
             let thinking = ""
-            let reasoning =
-              userRequestsReasoning &&
-              ragPipelineConfig[RagPipelineStages.AnswerOrSearch].reasoning
             let buffer = ""
             const conversationSpan = streamSpan.startSpan("conversation_search")
             if (deepResearchEnabled) {
@@ -6079,6 +6137,16 @@ export const MessageApi = async (c: Context) => {
                   break
                 }
                 if (chunk.text) {
+                  // Fallback for providers that emit JSON without explicit think end token.
+                  // If JSON has started, switch to answer parsing mode.
+                  if (
+                    reasoning &&
+                    !chunk.text.includes(EndThinkingToken) &&
+                    (chunk.text.trimStart().startsWith("{") ||
+                      chunk.text.includes('"answer":'))
+                  ) {
+                    reasoning = false
+                  }
                   if (reasoning) {
                     if (thinking && !chunk.text.includes(EndThinkingToken)) {
                       thinking += chunk.text
@@ -6126,6 +6194,7 @@ export const MessageApi = async (c: Context) => {
                             data: parsed.answer,
                           })
                         } else {
+                          hasConversationAnswer = true
                           // Subsequent chunks - send only the new part
                           const newText = parsed.answer.slice(
                             currentAnswer.length,
@@ -6158,6 +6227,9 @@ export const MessageApi = async (c: Context) => {
                   })
                 }
               }
+            }
+            if (hasConversationAnswer) {
+              parsed.answer = currentAnswer
             }
 
             conversationSpan.setAttribute("answer_found", parsed.answer)
@@ -6262,6 +6334,7 @@ export const MessageApi = async (c: Context) => {
                     `Follow-up query with file context detected. Using file-based context with NEW classification: ${JSON.stringify(classification)}, FileIds: ${JSON.stringify([fileIds, imageAttachmentFileIds])}`,
                   )
                   const allowChunkCitations = fileIds.some((fileId) => fileId.startsWith("clf-")) || fileIds.some((fileId) => fileId.startsWith("attf_"))
+                  reasoning = userRequestsReasoningAndEnabled && (MODEL_CONFIGURATIONS[actualModelId as Models || config.defaultBestModel]?.reasoning ?? true) === true
                   iterator = UnderstandMessageAndAnswerForGivenContext(
                     email,
                     ctx,
@@ -6269,7 +6342,7 @@ export const MessageApi = async (c: Context) => {
                     message,
                     0.5,
                     fileIds as string[],
-                    userRequestsReasoning,
+                    reasoning,
                     understandSpan,
                     undefined,
                     imageAttachmentFileIds,
@@ -6288,6 +6361,7 @@ export const MessageApi = async (c: Context) => {
 
               // If no iterator was set above (non-file-context scenario), use the regular flow with the new classification
               if (!iterator) {
+                reasoning = userRequestsReasoningAndEnabled && (MODEL_CONFIGURATIONS[actualModelId as Models || config.defaultBestModel]?.reasoning ?? true) === true
                 iterator = UnderstandMessageAndAnswer(
                   email,
                   ctx,
@@ -6296,7 +6370,7 @@ export const MessageApi = async (c: Context) => {
                   classification,
                   llmFormattedMessages,
                   0.5,
-                  userRequestsReasoning,
+                  reasoning,
                   understandSpan,
                   agentPromptValue,
                   actualModelId || config.defaultBestModel,
@@ -6307,7 +6381,6 @@ export const MessageApi = async (c: Context) => {
 
               answer = ""
               thinking = ""
-              reasoning = isReasoning && userRequestsReasoning
               citations = []
               let imageCitations: any[] = []
               citationMap = {}
@@ -6787,7 +6860,7 @@ export const MessageRetryApi = async (c: Context) => {
       }
     }
 
-    const userRequestsReasoning = isReasoningEnabled
+    const userRequestsReasoningAndEnabled = config.isReasoning && isReasoningEnabled
     const { sub, workspaceId } = c.get(JwtPayloadKey)
     email = sub ?? ""
 
@@ -6985,8 +7058,7 @@ export const MessageRetryApi = async (c: Context) => {
             let citationMap: Record<number, number> = {}
             let thinking = ""
             let reasoning =
-              userRequestsReasoning &&
-              ragPipelineConfig[RagPipelineStages.AnswerOrSearch].reasoning
+              userRequestsReasoningAndEnabled && (MODEL_CONFIGURATIONS[modelId as Models || config.defaultBestModel]?.reasoning ?? true) === true
 
             const understandSpan = streamSpan.startSpan("understand_message")
             understandSpan?.setAttribute(
@@ -7002,7 +7074,7 @@ export const MessageRetryApi = async (c: Context) => {
               message,
               0.5,
               fileIds,
-              userRequestsReasoning,
+              userRequestsReasoningAndEnabled,
               understandSpan,
               threadIds,
               imageAttachmentFileIds,
@@ -7017,7 +7089,6 @@ export const MessageRetryApi = async (c: Context) => {
 
             answer = ""
             thinking = ""
-            reasoning = isReasoning && userRequestsReasoning
             citations = []
             imageCitations = []
             citationMap = {}
@@ -7332,6 +7403,7 @@ export const MessageRetryApi = async (c: Context) => {
             const searchSpan = streamSpan.startSpan("conversation_search")
             // Get connected apps for LLM prompt
             const connectedApps = await getConnectedApps(db, email)
+            let reasoning = userRequestsReasoningAndEnabled && (MODEL_CONFIGURATIONS[modelId as Models || config.defaultBestModel]?.reasoning ?? true) === true
 
             const searchOrAnswerIterator =
               generateSearchQueryOrAnswerFromConversation(
@@ -7344,10 +7416,7 @@ export const MessageRetryApi = async (c: Context) => {
                     : config.defaultBestModel,
                   stream: true,
                   json: true,
-                  reasoning:
-                    userRequestsReasoning &&
-                    ragPipelineConfig[RagPipelineStages.AnswerOrSearch]
-                      .reasoning,
+                  reasoning,
                   messages: formatMessagesForLLM(topicConversationThread),
                 },
                 undefined,
@@ -7379,10 +7448,8 @@ export const MessageRetryApi = async (c: Context) => {
               type: "",
               filters: queryFilters,
             }
+            let hasConversationAnswer = false
             let thinking = ""
-            let reasoning =
-              userRequestsReasoning &&
-              ragPipelineConfig[RagPipelineStages.AnswerOrSearch].reasoning
             let buffer = ""
             for await (const chunk of searchOrAnswerIterator) {
               if (stream.closed) {
@@ -7440,6 +7507,7 @@ export const MessageRetryApi = async (c: Context) => {
                           data: parsed.answer,
                         })
                       } else {
+                        hasConversationAnswer = true
                         // Subsequent chunks - send only the new part
                         const newText = parsed.answer.slice(
                           currentAnswer.length,
@@ -7473,12 +7541,15 @@ export const MessageRetryApi = async (c: Context) => {
                 })
               }
             }
+            if (hasConversationAnswer) {
+              parsed.answer = currentAnswer
+            }
             searchSpan.setAttribute("answer_found", parsed.answer)
             searchSpan.setAttribute("answer", answer)
             searchSpan.setAttribute("query_rewrite", parsed.queryRewrite)
             searchSpan.end()
             let classification: QueryRouterLLMResponse
-            if (parsed.answer === null) {
+            if (parsed.answer === null || parsed.answer === "") {
               const ragSpan = streamSpan.startSpan("rag_processing")
               if (parsed.queryRewrite) {
                 loggerWithChild({ email: email }).info(
@@ -7522,6 +7593,7 @@ export const MessageRetryApi = async (c: Context) => {
               )
 
               const understandSpan = ragSpan.startSpan("understand_message")
+              reasoning = userRequestsReasoningAndEnabled && (MODEL_CONFIGURATIONS[modelId as Models || config.defaultBestModel]?.reasoning ?? true) === true
               const iterator = UnderstandMessageAndAnswer(
                 email,
                 ctx,
@@ -7530,7 +7602,7 @@ export const MessageRetryApi = async (c: Context) => {
                 classification,
                 convWithNoErrMsg,
                 0.5,
-                userRequestsReasoning,
+                userRequestsReasoningAndEnabled,
                 understandSpan,
                 undefined,
                 modelId,
@@ -7542,7 +7614,6 @@ export const MessageRetryApi = async (c: Context) => {
               })
               answer = ""
               thinking = ""
-              reasoning = config.isReasoning && userRequestsReasoning
               citations = []
               citationMap = {}
               let citationValues: Record<number, string> = {}
@@ -8392,7 +8463,7 @@ export const GenerateChatTitleApi = async (c: Context) => {
       currentChat[1]?.messageRole === "assistant" &&
       currentChat[1]?.message
     ) {
-      assistantResponse = currentChat[1].message
+      assistantResponse = cleanCitationsFromResponse(currentChat[1].message)
     }
 
     const { user, workspace } = await getUserAndWorkspaceByEmail(

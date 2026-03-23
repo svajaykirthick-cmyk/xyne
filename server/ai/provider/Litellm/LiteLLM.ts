@@ -1,5 +1,5 @@
 import { type Message } from "@aws-sdk/client-bedrock-runtime"
-import BaseProvider from "@/ai/provider/base"
+import BaseProvider, { findImageByName, regex } from "@/ai/provider/base"
 import type { ConverseResponse, ModelParams } from "@/ai/types"
 import { AIProviders } from "@/ai/types"
 import { calculateCost } from "@/utils/index"
@@ -8,8 +8,168 @@ import { Subsystem } from "@/types"
 import { modelDetailsMap } from "@/ai/mappers"
 import OpenAI from "openai"
 import { getCostConfigForModel } from "@/ai/fetchModels"
+import config from "@/config"
+import fs from "fs"
+import path from "path"
 
 const Logger = getLogger(Subsystem.AI)
+const { StartThinkingToken, EndThinkingToken } = config
+
+const imageFormatToMimeType: Record<string, string> = {
+  png: "image/png",
+  jpeg: "image/jpeg",
+  jpg: "image/jpeg",
+  gif: "image/gif",
+  webp: "image/webp",
+}
+
+const getMessageText = (message: Message): string =>
+  (message.content ?? [])
+    .filter((block: any) => typeof block?.text === "string")
+    .map((block: any) => block.text)
+    .join("\n")
+
+function extractReasoningText(rawReasoning: any): string {
+  if (typeof rawReasoning === "string") {
+    return rawReasoning
+  }
+  if (Array.isArray(rawReasoning)) {
+    return rawReasoning
+      .map((part: any) => (typeof part === "string" ? part : (part?.text ?? "")))
+      .join("")
+  }
+  if (rawReasoning && typeof rawReasoning === "object") {
+    return (rawReasoning as any).text || ""
+  }
+  return ""
+}
+
+const buildLiteLLMImageParts = async (
+  imagePaths: string[],
+): Promise<OpenAI.Chat.Completions.ChatCompletionContentPartImage[]> => {
+  const baseDir = path.resolve(process.env.IMAGE_DIR || "downloads/xyne_images_db")
+
+  const imagePromises = imagePaths.map(async (imgPath) => {
+    const match = imgPath.match(regex)
+    if (!match) {
+      Logger.warn(
+        `Invalid image path format: ${imgPath}. Expected format: docIndex_docId_imageNumber`,
+      )
+      return null
+    }
+
+    const docId = match[2]
+    const imageNumber = match[3]
+
+    if (docId.includes("..") || docId.includes("/") || docId.includes("\\")) {
+      Logger.warn(`Invalid docId containing path traversal: ${docId}`)
+      return null
+    }
+
+    const imageDir = path.join(baseDir, docId)
+    const absolutePath = findImageByName(imageDir, imageNumber)
+    const extension = path.extname(absolutePath).toLowerCase()
+    const mimeType = imageFormatToMimeType[extension.replace(".", "")]
+    if (!mimeType) {
+      Logger.warn(
+        `Unsupported image format: ${extension}. Skipping image: ${absolutePath}`,
+      )
+      return null
+    }
+
+    const resolvedPath = path.resolve(imageDir)
+    if (!resolvedPath.startsWith(baseDir)) {
+      Logger.warn(`Path traversal attempt detected: ${imageDir}`)
+      return null
+    }
+
+    try {
+      await fs.promises.access(absolutePath, fs.constants.F_OK)
+      const imageBytes = await fs.promises.readFile(absolutePath)
+
+      if (imageBytes.length > 4 * 1024 * 1024) {
+        Logger.warn(
+          `Image buffer too large after read (${imageBytes.length} bytes, ${(imageBytes.length / (1024 * 1024)).toFixed(2)}MB): ${absolutePath}. Skipping this image.`,
+        )
+        return null
+      }
+
+      return {
+        type: "image_url" as const,
+        image_url: {
+          url: `data:${mimeType};base64,${imageBytes.toString("base64")}`,
+        },
+      }
+    } catch (error) {
+      Logger.warn(
+        `Failed to read image file ${absolutePath}: ${error instanceof Error ? error.message : error}`,
+      )
+      return null
+    }
+  })
+
+  const results = await Promise.all(imagePromises)
+  return results.filter(
+    (
+      part,
+    ): part is OpenAI.Chat.Completions.ChatCompletionContentPartImage =>
+      part !== null,
+  )
+}
+
+const transformLiteLLMMessages = async (
+  messages: Message[],
+  imageFileNames?: string[],
+): Promise<OpenAI.Chat.Completions.ChatCompletionMessageParam[]> => {
+  const imageParts =
+    imageFileNames && imageFileNames.length > 0
+      ? await buildLiteLLMImageParts(imageFileNames)
+      : []
+
+  const lastUserMessageIndex =
+    messages
+      .map((m, idx) => ({ message: m, index: idx }))
+      .reverse()
+      .find(({ message }) => message.role === "user")?.index ?? -1
+
+  return messages.map((message, index) => {
+    const role = message.role === "assistant" ? "assistant" : "user"
+    const text = getMessageText(message)
+
+    if (role === "user" && index === lastUserMessageIndex && imageParts.length > 0) {
+      const labeledParts: OpenAI.Chat.Completions.ChatCompletionContentPart[] = [
+        {
+          type: "text",
+          text:
+            "You may receive image(s) as part of the conversation. If images are attached, treat them as essential context for the user's question. When referring to images in your response, please use the labels provided [docIndex_imageNumber] (e.g., [0_12], [7_2], etc.).\n\n" +
+            text,
+        },
+      ]
+
+      imageParts.forEach((part, i) => {
+        const imageFileName = imageFileNames?.[i] || ""
+        const match = imageFileName.match(regex)
+        if (match) {
+          labeledParts.push({
+            type: "text",
+            text: `\n--- imageNumber: ${match[3]}, docIndex: ${match[1]} ---`,
+          })
+        }
+        labeledParts.push(part)
+      })
+
+      return {
+        role: "user",
+        content: labeledParts,
+      }
+    }
+
+    return {
+      role,
+      content: text,
+    }
+  })
+}
 
 interface LiteLLMClientConfig {
   apiKey: string
@@ -43,17 +203,16 @@ export class LiteLLMProvider extends BaseProvider {
     params: ModelParams,
   ): Promise<ConverseResponse> {
     const modelParams = this.getModelParams(params)
+    Logger.info({
+      modelId: modelParams.modelId,
+      thinking: params.reasoning ?? false,
+    }, "LiteLLM Converse called with model:")
     const client = (this.client as LiteLLM).getClient()
 
     try {
       // Transform messages to OpenAI-compatible format
-      const transformedMessages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = messages.map((message) => {
-        const role = message.role === "assistant" ? "assistant" : "user"
-        return {
-          role,
-          content: message.content?.[0]?.text || "",
-        }
-      })
+      const transformedMessages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] =
+        await transformLiteLLMMessages(messages, params.imageFileNames)
 
       const openaiMessages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
         {
@@ -74,7 +233,7 @@ export class LiteLLMProvider extends BaseProvider {
           }))
         : undefined
 
-      const requestParams: OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming = {
+      const requestParams: OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming & { extra_body?: Record<string, unknown> } = {
         model: modelParams.modelId,
         messages: openaiMessages,
         max_tokens: modelParams.maxTokens,
@@ -82,6 +241,11 @@ export class LiteLLMProvider extends BaseProvider {
         tools,
         tool_choice: tools ? (params.tool_choice ?? "auto") : undefined,
         response_format: modelParams.json ? { type: "json_object" } : undefined,
+        extra_body: {
+          chat_template_kwargs: {
+            enable_thinking: params.reasoning ?? false,
+          },
+        },
       }
       
       const response = await client.chat.completions.create(requestParams)
@@ -147,17 +311,16 @@ export class LiteLLMProvider extends BaseProvider {
     params: ModelParams,
   ): AsyncIterableIterator<ConverseResponse> {
     const modelParams = this.getModelParams(params)
+    Logger.info({
+      modelId: modelParams.modelId,
+      thinking: params.reasoning ?? false,
+    }, "LiteLLM ConverseStream called with model:")
     const client = (this.client as LiteLLM).getClient()
 
     try {
       // Transform messages to OpenAI-compatible format
-      const transformedMessages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = messages.map((message) => {
-        const role = message.role === "assistant" ? "assistant" : "user"
-        return {
-          role,
-          content: message.content?.[0]?.text || "",
-        }
-      })
+      const transformedMessages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] =
+        await transformLiteLLMMessages(messages, params.imageFileNames)
 
       const openaiMessages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
         {
@@ -178,7 +341,7 @@ export class LiteLLMProvider extends BaseProvider {
           }))
         : undefined
 
-      const requestParams: OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming = {
+      const requestParams: OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming & { extra_body?: Record<string, unknown> } = {
         model: modelParams.modelId,
         messages: openaiMessages,
         max_tokens: modelParams.maxTokens,
@@ -190,11 +353,18 @@ export class LiteLLMProvider extends BaseProvider {
         stream_options: {
           include_usage: true,
         },
+        extra_body: {
+          chat_template_kwargs: {
+            enable_thinking: params.reasoning ?? false,
+          },
+        },
       }
 
       let accumulatedCost = 0
       let toolCalls: any[] = []
       let hasYieldedToolCalls = false
+      let startedReasoning = false
+      let reasoningComplete = false
 
       const stream = await client.chat.completions.create(requestParams)
 
@@ -228,8 +398,31 @@ export class LiteLLMProvider extends BaseProvider {
         const delta = choice.delta
         const finishReason = choice.finish_reason
 
-        // Handle text content
+        // Handle reasoning content from OpenAI-compatible providers (LiteLLM backends vary).
+        if (params.reasoning && !reasoningComplete) {
+          const rawReasoning =
+            (delta as any)?.reasoning_content ??
+            (delta as any)?.reasoning ??
+            (delta as any)?.reasoning_text
+          const reasoningText = extractReasoningText(rawReasoning)
+          if (reasoningText) {
+            if (!startedReasoning) {
+              yield { text: `${StartThinkingToken}${reasoningText}` }
+              startedReasoning = true
+            } else {
+              yield { text: reasoningText }
+            }
+          }
+        }
+
+        // Handle text content.
+        // Some LiteLLM backends may start emitting answer content before finish_reason.
+        // Close thinking as soon as first content token arrives so downstream parser can consume JSON.
         if (delta?.content) {
+          if (params.reasoning && !reasoningComplete) {
+            yield { text: EndThinkingToken }
+            reasoningComplete = true
+          }
           yield {
             text: delta.content,
             cost: 0, // Cost will be yielded at the end
@@ -262,6 +455,11 @@ export class LiteLLMProvider extends BaseProvider {
 
         // Check if this is the final chunk
         if (finishReason) {
+          // Close reasoning segment if it was started.
+          if (startedReasoning && !reasoningComplete) {
+            yield { text: EndThinkingToken }
+            reasoningComplete = true
+          }
           // Yield tool calls if we have any and haven't yielded them yet
           if (toolCalls.length > 0 && !hasYieldedToolCalls) {
             hasYieldedToolCalls = true
