@@ -1,3 +1,10 @@
+## [3.44.3](https://github.com/xynehq/xyne/compare/v3.44.2...v3.44.3) (2026-03-23)
+
+
+### Bug Fixes
+
+* reasoning logic and litellm provider ([#1291](https://github.com/xynehq/xyne/issues/1291)) ([b791f71](https://github.com/xynehq/xyne/commit/b791f718082062e553a5a7db1e4f80a823ba7dc4))
+
 ## [3.44.2](https://github.com/xynehq/xyne/compare/v3.44.1...v3.44.2) (2026-03-23)
 
 
