@@ -1,3 +1,10 @@
+## [3.44.4](https://github.com/xynehq/xyne/compare/v3.44.3...v3.44.4) (2026-03-24)
+
+
+### Bug Fixes
+
+* empty chunk issue in pdfs ([#1292](https://github.com/xynehq/xyne/issues/1292)) ([981727f](https://github.com/xynehq/xyne/commit/981727f098ff6ca0a187cbbbe92bc4c078e6b43c))
+
 ## [3.44.3](https://github.com/xynehq/xyne/compare/v3.44.2...v3.44.3) (2026-03-23)
 
 
