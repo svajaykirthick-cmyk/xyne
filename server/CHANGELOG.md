@@ -1,3 +1,10 @@
+## [3.44.5](https://github.com/xynehq/xyne/compare/v3.44.4...v3.44.5) (2026-03-26)
+
+
+### Bug Fixes
+
+* kb api permissions checks fixed ([#1295](https://github.com/xynehq/xyne/issues/1295)) ([63788eb](https://github.com/xynehq/xyne/commit/63788eb2c33b09e8e683dd80547a0251856b6f3e))
+
 ## [3.44.4](https://github.com/xynehq/xyne/compare/v3.44.3...v3.44.4) (2026-03-24)
 
 
