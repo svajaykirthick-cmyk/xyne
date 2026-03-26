@@ -30,14 +30,13 @@ export { getAgentsMadeByMe, getAgentsSharedToMe }
 const loggerWithChild = getLoggerWithChild(Subsystem.Db)
 
 // Helper to update collection permissions based on ownerEmails
-async function updateCollectionsWithOwnerEmails(
+async function updateCollectionsWithSharedEmails(
   trx: TxnOrClient,
   agentData: any,
   newAgent: SelectAgent,
-  userId: number,
 ) {
-  const agentOwnerEmails = agentData.ownerEmails || []
-  if (!agentOwnerEmails.length) return
+  const agentSharedEmails = [...(agentData.ownerEmails || []), ...(agentData.userEmails || [])]
+  if (!agentSharedEmails.length) return
 
   const collectionIds = await getAgentCollectionIds(trx, newAgent)
   if (!collectionIds.length) return
@@ -57,7 +56,7 @@ async function updateCollectionsWithOwnerEmails(
 
         // Get userIds from emails
         const userIds: number[] = []
-        for (const email of agentOwnerEmails) {
+        for (const email of agentSharedEmails) {
           try {
             const users = await getUserByEmail(trx, email)
             if (users && users.length > 0) {
@@ -83,7 +82,7 @@ async function updateCollectionsWithOwnerEmails(
             updatedAt: new Date(),
           })
           loggerWithChild().info(
-            `Updated permissions for collection ${collectionId}: added ${agentOwnerEmails.length} emails`,
+            `Updated permissions for collection ${collectionId}: added ${agentSharedEmails.length} emails`,
           )
         }
       }
@@ -97,13 +96,17 @@ async function updateCollectionsWithOwnerEmails(
 
 export const insertAgent = async (
   trx: TxnOrClient,
-  agentData: Omit<InsertAgent, "externalId" | "userId" | "workspaceId">,
+  agentData: Omit<InsertAgent, "externalId" | "userId" | "workspaceId"> & {
+    ownerEmails?: string[]
+    userEmails?: string[]
+  },
   userId: number,
   workspaceId: number,
 ): Promise<SelectAgent> => {
+  const { ownerEmails, userEmails, ...dbFields } = agentData
   const externalId = createId()
   const agentWithIds = {
-    ...agentData,
+    ...dbFields,
     externalId,
     userId,
     workspaceId,
@@ -133,7 +136,7 @@ export const insertAgent = async (
 
     // Handle collection permissions for agent's knowledge base integrations
     try {
-      await updateCollectionsWithOwnerEmails(tx, agentData, newAgent, userId)
+      await updateCollectionsWithSharedEmails(tx, agentData, newAgent)
     } catch (error) {
       loggerWithChild().warn(
         `Failed to process collection permissions for agent ${newAgent.externalId}: ${error}`,
@@ -240,10 +243,12 @@ export const updateAgentByExternalId = async (
   agentData: Partial<
     Omit<InsertAgent, "externalId" | "userId" | "workspaceId"> & {
       ownerEmails?: string[]
+      userEmails?: string[]
     }
   >,
 ): Promise<SelectAgent | null> => {
-  const updateData = { ...agentData, updatedAt: new Date() }
+  const { ownerEmails, userEmails, ...dbFields } = agentData
+  const updateData = { ...dbFields, updatedAt: new Date() }
   // Validate partial update data - Drizzle Zod doesn't directly support partial insert schemas for updates
   // We can manually pick keys or ensure the input is structured correctly.
   // For simplicity, we assume agentData contains valid updatable fields.
@@ -265,25 +270,16 @@ export const updateAgentByExternalId = async (
   }
   const updatedAgent = selectAgentSchema.parse(agentArr[0])
 
-  // If ownerEmails is present in agentData, update collection permissions
-  if (
-    agentData?.ownerEmails &&
-    Array.isArray(agentData.ownerEmails) &&
-    agentData.ownerEmails.length > 0
-  ) {
-    try {
-      // We don't have userId here, so pass updatedAgent.userId
-      await updateCollectionsWithOwnerEmails(
-        trx,
-        agentData,
-        updatedAgent,
-        updatedAgent.userId,
-      )
-    } catch (error) {
-      loggerWithChild().warn(
-        `Failed to process collection permissions for agent ${updatedAgent.externalId}: ${error}`,
-      )
-    }
+  try {
+    await updateCollectionsWithSharedEmails(
+      trx,
+      agentData,
+      updatedAgent,
+    )
+  } catch (error) {
+    loggerWithChild().warn(
+      `Failed to process collection permissions for agent ${updatedAgent.externalId}: ${error}`,
+    )
   }
 
   return updatedAgent
@@ -298,7 +294,10 @@ export const updateAgentByExternalIdWithPermissionCheck = async (
   workspaceId: number,
   userId: number,
   agentData: Partial<
-    Omit<InsertAgent, "externalId" | "userId" | "workspaceId">
+    Omit<InsertAgent, "externalId" | "userId" | "workspaceId"> & {
+      ownerEmails?: string[]
+      userEmails?: string[]
+    }
   >,
 ): Promise<SelectAgent | null> => {
   // Check if user has permission (owner or editor)
