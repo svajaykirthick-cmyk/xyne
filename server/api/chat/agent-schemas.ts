@@ -79,6 +79,9 @@ export interface DocumentImageReference {
   isAttachment: boolean
 }
 
+/** How long a synthetic doc stays in document memory. Do not infer this from `expiresAtTurn` alone. */
+export type SyntheticDocLifecycle = "ttl" | "until_review" | "persistent"
+
 /**
  * Document-centric state: one per docId, accumulated across turns.
  * Used for review, synthesis, and stagnation; MinimalAgentFragment[] are built on demand from this.
@@ -101,6 +104,12 @@ export interface DocumentState {
   vespaHit?: VespaSearchResults
   /** Cached fragment (built via answerContextMap or joined chunks). Invalidated when doc is updated by merge. */
   cachedFragment?: MinimalAgentFragment
+  /** Whether this is a synthetic document (derived, not from Vespa). */
+  isSynthetic?: boolean
+  /** Synthetic docs only: when and how the doc is removed (`ttl` uses `expiresAtTurn`). */
+  lifecycle?: SyntheticDocLifecycle
+  /** When `lifecycle === "ttl"`, removed when `expiresAtTurn <= currentTurn` (see cleanupExpiredSyntheticDocs). */
+  expiresAtTurn?: number
 }
 
 /** Limits for document memory eviction (see memory-architecture-across-turns.md). */
@@ -476,10 +485,12 @@ export const PlanStateSchema = z.object({
 export const RunPublicAgentInputSchema = z.object({
   agentId: z
     .string()
-    .describe("Agent identifier returned by list_custom_agents"),
+    .describe("Agent identifier. For internal agents, use the ID from the system prompt. For custom agents, use the ID returned by list_custom_agents."),
   query: z
     .string()
-    .describe("Fully disambiguated, agent-specific instructions for this run"),
+    .describe(
+      "Fully disambiguated, agent-specific instructions for this run. Must match the expected input format described for the selected agent in the system prompt.",
+    ),
   context: z
     .string()
     .optional()

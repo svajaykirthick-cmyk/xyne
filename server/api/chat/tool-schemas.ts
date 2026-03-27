@@ -497,6 +497,21 @@ export type ListCustomAgentsOutput = z.infer<
 export type ResourceAccessItem = z.infer<typeof ResourceItemSchema>
 export type ResourceAccessSummary = z.infer<typeof ResourceAccessSummarySchema>
 
+/**
+ * AgentBrief - Summarized view of an agent for selection and routing
+ */
+export interface AgentBrief {
+  agentId: string
+  agentName: string
+  description: string
+  capabilities: string[]
+  domains: string[]
+  estimatedCost: "low" | "medium" | "high"
+  averageLatency: number
+  isPublic: boolean
+  resourceAccess?: ResourceAccessSummary[]
+}
+
 // Review agent input
 export const ReviewAgentInputSchema = z.object({})
 
@@ -783,13 +798,13 @@ export const TOOL_SCHEMAS: Record<string, ToolSchema> = {
     description: [
       "Find relevant custom agents for a query.",
       "Parameters: query (user intent), requiredCapabilities (capabilities string[]), maxAgents (upper bound).",
-      "Always run this before calling run_public_agent; it returns null when no agent is confident enough.",
+      "Call this before delegating to custom agents; returns null when no agent is confident enough.",
       "Use the output to compare multiple candidates before choosing one.",
     ].join(" "),
     category: ToolCategory.Agent,
     inputSchema: ListCustomAgentsInputSchema,
     outputSchema: ListCustomAgentsOutputSchema,
-    prerequisites: ["Must be called before run_public_agent"],
+    prerequisites: ["Must be called before run_public_agent for custom agents"],
     examples: [
       {
         scenario: "Identify renewal-focused agents for ACME Q4 blockers",
@@ -847,18 +862,44 @@ export const TOOL_SCHEMAS: Record<string, ToolSchema> = {
   run_public_agent: {
     name: XyneTools.runPublicAgent,
     description: [
-      "Execute a vetted custom agent using a precise query.",
-      "Arguments: agentId (from list_custom_agents), query (tailored instructions), optional context (extra grounding), optional maxTokens (cap output cost).",
-      "Only call this after ambiguity is resolved and you've logged why this specific agent is the best fit.",
+      "Delegate a task to another agent (internal or custom).",
+      "Use when specialized capabilities are required beyond available tools.",
+      "Internal agents are always available and described in the system prompt; use directly without calling list_custom_agents.",
+      "For custom agents, you MUST call list_custom_agents first.",
+      "Arguments: agentId, query, optional context, optional maxTokens.",
+      "Ensure the query matches the expected input format of the selected agent.",
+      "Only call after ambiguity is resolved and agent selection is justified.",
     ].join(" "),
     category: ToolCategory.Agent,
     inputSchema: RunPublicAgentInputSchema,
     outputSchema: ToolOutputSchema,
     prerequisites: [
-      "Must call list_custom_agents first",
+      "Must call list_custom_agents first for non-built-in agents",
       "ambiguityResolved must be true",
     ],
     examples: [
+      {
+        scenario:
+          "Delegate deep reading with some offsets (chunk indices) when fragments are insufficient for a document-level answer",
+        input: {
+          agentId: "deep_document_agent",
+          query: JSON.stringify({
+            userQuery:
+              "Summarize the document and extract all security obligations.",
+            docId: "attf_abc123",
+            startingOffsets: [42, 43],
+          }),
+          maxTokens: 1200,
+        },
+        output: {
+          result:
+            "Deep Document Agent analyzed the target document and returned a structured summary of obligations.",
+          metadata: {
+            agentId: "deep_document_agent",
+            tokensUsed: 910,
+          },
+        },
+      },
       {
         scenario: "Delegate Delta Airlines renewal recap to Renewal Navigator",
         input: {
