@@ -33,19 +33,37 @@ fi
 # Initialize retry counters
 ATTEMPTS=0
 MAX_ATTEMPTS="${DB_WAIT_MAX_ATTEMPTS:-150}"
+DB_CONNECTED=0
+
+# Build a small set of candidate URLs so managed Postgres providers that
+# require SSL can still be reached without manual URL tweaking.
+DB_URL_CANDIDATES=()
+DB_URL_CANDIDATES+=("${DATABASE_URL}")
+
+if [[ "${DATABASE_URL}" != *"sslmode="* ]]; then
+  if [[ "${DATABASE_URL}" == *"?"* ]]; then
+    DB_URL_CANDIDATES+=("${DATABASE_URL}&sslmode=require")
+  else
+    DB_URL_CANDIDATES+=("${DATABASE_URL}?sslmode=require")
+  fi
+fi
 
 while [ $ATTEMPTS -lt $MAX_ATTEMPTS ]; do
-  if bun -e "import postgres from 'postgres'; const sql = postgres(process.env.DATABASE_URL); await sql\`SELECT 1\`; await sql.end();" 2>/dev/null; then
-    echo "PostgreSQL is ready!"
-    break
-  fi
+  for CANDIDATE_URL in "${DB_URL_CANDIDATES[@]}"; do
+    if DATABASE_URL="${CANDIDATE_URL}" bun -e "import postgres from 'postgres'; const sql = postgres(process.env.DATABASE_URL); await sql\`SELECT 1\`; await sql.end();" 2>/dev/null; then
+      export DATABASE_URL="${CANDIDATE_URL}"
+      DB_CONNECTED=1
+      echo "PostgreSQL is ready!"
+      break 2
+    fi
+  done
   
   ATTEMPTS=$((ATTEMPTS + 1))
   echo "PostgreSQL is unavailable - sleeping (attempt $ATTEMPTS/$MAX_ATTEMPTS)"
   sleep 2
 done
 
-if [ $ATTEMPTS -ge $MAX_ATTEMPTS ]; then
+if [ "$DB_CONNECTED" -ne 1 ]; then
   echo "ERROR: Failed to connect to PostgreSQL after $MAX_ATTEMPTS attempts"
   exit 1
 fi
